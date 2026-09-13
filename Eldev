@@ -1,0 +1,8 @@
+;;; Eldev project file for ei-interface
+
+;; ei-interface has no external dependencies, so no package
+;; archives are configured.
+
+;; Run all tests:  eldev test
+;; Run one file:   eldev test -f ei-generics-tests.el
+;; Run one test:   eldev test -f ei-generics-tests.el ei-choose-back-resumes-parent
