@@ -31,7 +31,7 @@
 ;; `ei-delete' drive the descent: EIEIO objects (choose a slot),
 ;; obarrays (choose a symbol), hash tables (choose a key), lists
 ;; (choose an element) and symbols (choose the value or a property);
-;; atoms are leaves.  Every completion goes through `ei-choose--read'
+;; atoms are leaves.  Every completion goes through `ei-read'
 ;; and `ei-choose--read-once', which report either the chosen entry or
 ;; an action picked in the menu; `ei-choose--handle-read-result'
 ;; dispatches on that report.
@@ -128,7 +128,7 @@ to (OBJECT SLOT-NAME ARGS) first; when no test matches, the
 chosen slot's value is returned, chosen into recursively while
 RECURSE is non-nil and VALUE-ONLY is nil."
   (let ((entries (ei-choose--class-slots object)))
-    (ei-choose--read-and-handle
+    (ei-read
       (format "Slot of %s: " (eieio-object-class object))
       entries
       (lambda (choice new-history)
@@ -157,14 +157,14 @@ RECURSE is non-nil and VALUE-ONLY is nil."
       :history-list history-list
       :require-match t
       :initial-input initial-input
-      :annotation (ei-choose--annotator object))))
+      :annotation (ei-annotator object))))
 
 (cl-defmethod ei-choose ((sym symbol) &key history-list &allow-other-keys)
   "Choose a property of SYM and return its value.
 The symbol's own value is offered under the name `value' when SYM
 is bound."
   (let ((entries (ei-choose--symbol-entries sym)))
-    (ei-choose--read-and-handle
+    (ei-read
       "Property of symbol: " entries
       (lambda (choice _new-history)
         (let ((prop (cdr (assoc choice entries))))
@@ -174,7 +174,7 @@ is bound."
            (t nil))))
       :object sym :path ei-current-path
       :history-list history-list
-      :annotation (ei-choose--annotator sym))))
+      :annotation (ei-annotator sym))))
 
 (cl-defmethod ei-choose ((array obarray) &key test fun args initial-input
                          value-only history-list (recurse t)
@@ -184,7 +184,7 @@ Return the symbol's value when it is bound and VALUE-ONLY is
 non-nil or RECURSE is nil; otherwise choose into the symbol's
 properties.  An unbound chosen symbol is returned itself.  TEST
 and FUN are applied to (ARRAY SYMBOL ARGS) first."
-  (ei-choose--read-and-handle
+  (ei-read
     "Entry of obarray: " array
     (lambda (choice new-history)
       (let* ((sym (intern-soft choice array))
@@ -202,10 +202,11 @@ and FUN are applied to (ARRAY SYMBOL ARGS) first."
     :object array :path ei-current-path
     :history-list history-list
     :initial-input initial-input
-    :annotation (ei-choose--annotator array)))
+    :annotation (ei-annotator array)))
 
 (cl-defmethod ei-choose ((lst list) &key test fun args _initial-input
                          value-only history-list (recurse t)
+                         (require-match nil)
                          &allow-other-keys)
   "Choose an element of LST.
 Candidates are the elements themselves, named as in
@@ -213,15 +214,17 @@ Candidates are the elements themselves, named as in
 of a string or character list is accepted as a new element, see
 `ei-choose--list-entry-element'.  TEST and FUN are applied to
 (LST ELEMENT ARGS) first.  With VALUE-ONLY non-nil or RECURSE
-nil the chosen element is returned without descending into it."
+nil the chosen element is returned without descending into it.
+REQUIRE-MATCH is forwarded to the completing read; pass it
+non-nil when the caller needs one of LST's actual elements."
   (let ((entries (ei-choose--list-entries lst)))
-    (ei-choose--read-and-handle
+    (ei-read
       "Element: " (mapcar #'car entries)
       (lambda (choice new-history)
         (let* ((chosen (ei-choose--list-entry-element lst choice))
                (op (and test fun
                         (ei-choose--apply-op lst chosen
-                                              test fun args))))
+                                             test fun args))))
           (cond
            (op (cdr op))
            ((and chosen recurse (not value-only))
@@ -232,7 +235,8 @@ nil the chosen element is returned without descending into it."
            (t chosen))))
       :object lst :path ei-current-path
       :history-list history-list
-      :annotation (ei-choose--annotator lst))))
+      :require-match require-match
+      :annotation (ei-annotator lst))))
 
 (cl-defmethod ei-choose ((table hash-table) &key test fun args initial-input
                          value-only history-list (recurse t)
@@ -242,7 +246,7 @@ Return the key's value when VALUE-ONLY is non-nil or the value is
 a leaf; otherwise choose into the value recursively.  TEST and
 FUN are applied to (TABLE KEY ARGS) first."
   (let ((entries (ei-choose--hash-entries table)))
-    (ei-choose--read-and-handle
+    (ei-read
       "Key: " (mapcar #'car entries)
       (lambda (choice new-history)
         (let* ((key (cdr (assoc choice entries)))
@@ -262,7 +266,7 @@ FUN are applied to (TABLE KEY ARGS) first."
       :object table :path ei-current-path
       :history-list history-list
       :initial-input initial-input
-      :annotation (ei-choose--annotator table))))
+      :annotation (ei-annotator table))))
 
 (cl-defmethod ei-choose ((str string) &key _history-list &allow-other-keys)
   "Return STR; strings are leaves of the choice tree.
@@ -300,18 +304,47 @@ the existing entries with `ei-check'."
       (ei-add array :key key :value val :history-list history-list)))
    (t
     (pcase-let ((`(,name . ,new-history)
-                 (ei-choose--read-and-handle
+                 (ei-read
                    "Name: " array
                    (lambda (choice hist) (cons choice hist))
                    :object array
                    :path ei-current-path
                    :history-list history-list
-                   :annotation (ei-choose--annotator array))))
+                   :annotation (ei-annotator array))))
       (let ((checked (ei-check array name :history-list new-history)))
         (if value-supplied-p
             (ei-add array :key checked :value value
                     :history-list new-history)
           (ei-add array :key checked :history-list new-history)))))))
+
+(cl-defmethod ei-add ((table hash-table)
+                      &key key (value nil value-supplied-p)
+                      history-list &allow-other-keys)
+  "Add an entry to TABLE and return its key.
+Without KEY, read the key through the choice interface with
+completion over the existing keys; a name matching none of them
+is a new key, converted by `ei-choose--hash-entry-key'.  Without
+a supplied VALUE (which may be nil), read the value as a Lisp
+object, with the key's current value as the default.  Return nil
+and leave TABLE alone when no key was read."
+  (let ((key (or key
+                 (ei-read
+                   "New key: " (mapcar #'car (ei-choose--hash-entries table))
+                   (lambda (choice _new-history)
+                     (ei-choose--hash-entry-key table choice))
+                   :object table :path ei-current-path
+                   :history-list history-list
+                   :annotation (ei-annotator table)))))
+    (when key
+      (puthash key
+               (if value-supplied-p
+                   value
+                 (let ((old (gethash key table)))
+                   (read-from-minibuffer (format "Value for %s: " key)
+                                         (and old (prin1-to-string old))
+                                         nil t)))
+               table)
+      key)))
 
 (cl-defmethod ei-add ((lst list) &key value history-list &allow-other-keys)
   "Add VALUE or a newly read element to LST and return the new list.
@@ -332,7 +365,8 @@ stored in `ei-edit--store-back' for the owning place, see there."
                             (slot-boundp obj 'name)
                             (slot-value obj 'name)))
                :fun (lambda (_lst obj)
-                      (ei-add obj :history-list history-list))))
+                      (ei-add obj :history-list history-list))
+               :history-list history-list))
    (t
     (let ((elt (ei-choose--read-element lst
                                         :history-list history-list)))
@@ -353,7 +387,7 @@ non-nil status.")
 The candidates carry the annotations of the choice interface and
 the action menu (M-a) and the candidate documentation (M-h) are
 available while choosing.  Return ARRAY."
-  (ei-choose--read-and-handle
+  (ei-read
     "Delete from obarray: " array
     (lambda (choice _new-history)
       (let ((sym (intern-soft choice array)))
@@ -364,7 +398,24 @@ available while choosing.  Return ARRAY."
     :object array :path ei-current-path
     :history-list history-list
     :require-match t
-    :annotation (ei-choose--annotator array)))
+    :annotation (ei-annotator array)))
+
+(cl-defmethod ei-delete ((table hash-table) &key history-list
+                         &allow-other-keys)
+  "Interactively delete a key from TABLE through the choice interface.
+Return TABLE."
+  (let ((entries (ei-choose--hash-entries table)))
+    (ei-read
+      "Delete key: " (mapcar #'car entries)
+      (lambda (choice _new-history)
+        (when-let* ((entry (assoc choice entries)))
+          (remhash (cdr entry) table)
+          (message "Deleted %s from hash table." choice))
+        table)
+      :object table :path ei-current-path
+      :history-list history-list
+      :require-match t
+      :annotation (ei-annotator table))))
 
 (cl-defgeneric ei-move (first second)
   "Move an entry from FIRST to SECOND.
@@ -408,6 +459,48 @@ owning place can install it, see there."
     (setq ei-edit--store-back new)
     new))
 
+(defun ei-edit--value (value prompt history-list)
+  "Edit VALUE, the content of a place, for the owner of that place.
+Return (t . NEW) when the owner must store NEW in the place and
+\(nil . RESULT) when there is nothing to store, RESULT being what
+`ei-edit' returned.  The methods of `ei-edit' that own places ---
+slots, hash-table values, symbol values and properties --- edit
+through this function, so they all treat values alike:
+
+- Constants (t, nil, keywords), numbers and symbols without a
+  value or properties are replaced: the replacement is read as a
+  Lisp object with PROMPT.  A symbol that has a value or
+  properties asks first whether to replace it or to edit the
+  symbol itself.
+- Lists are edited by `ei-edit', which hands the new list over
+  through `ei-edit--store-back'; the new list is to be stored
+  even when it is empty.
+- Other leaves (strings and remaining atoms) are edited by
+  `ei-edit' and its non-nil result is to be stored.
+- In-place containers and symbols edited in themselves write
+  their own changes; nothing is to be stored.
+
+HISTORY-LIST is the history threaded through the reads."
+  (if (or (ei-choose--constant-symbol-p value)
+          (numberp value)
+          (and (symbolp value)
+               (or (null (ei-choose--symbol-entries value))
+                   (eq ?r (car (read-multiple-choice
+                                (format "`%s' is a symbol" value)
+                                '((?r "replace"
+                                      "Store another value in this place")
+                                  (?p "properties"
+                                      "Edit the symbol's value or properties"))))))))
+      (cons t (read-from-minibuffer prompt (prin1-to-string value) nil t))
+    (let* ((ei-edit--store-back 'unset)
+           (new (ei-edit value :history-list history-list)))
+      (cond ((listp ei-edit--store-back) (cons t ei-edit--store-back))
+            ((and new
+                  (not (symbolp value))
+                  (not (ei-choose--container-kind value)))
+             (cons t new))
+            (t (cons nil new))))))
+
 (cl-defgeneric ei-edit (object &key history-list &allow-other-keys)
   "Interactively edit data inside OBJECT.
 
@@ -430,7 +523,7 @@ form (:old OLD-VALUE :symbol SYMBOL :new NEW-VALUE) describing
 the edit; OLD-VALUE and NEW-VALUE are the values before and
 after the edit on the value path and both nil when a property of
 the symbol was edited instead."
-  (ei-choose--read-and-handle
+  (ei-read
     "Edit entry of obarray: " array
     (lambda (choice new-history)
       (let* ((sym (intern-soft choice array))
@@ -448,7 +541,7 @@ the symbol was edited instead."
     :object array :path ei-current-path
     :history-list history-list
     :require-match t
-    :annotation (ei-choose--annotator array)))
+    :annotation (ei-annotator array)))
 
 (cl-defmethod ei-edit ((str string) &key _history-list &allow-other-keys)
   "Edit STR by prompting the user in the minibuffer.
@@ -459,80 +552,109 @@ Returns the user's input as a new string."
   "Hook run after a property of SYMBOL was set to NEW-VALUE.
 The default method does nothing; specialize it to maintain
 derived state after property edits, e.g. caches that depend on
-specific properties.")
+specific properties."
+  nil)
 
 (cl-defmethod ei-edit ((sym symbol) &key history-list &allow-other-keys)
   "Edit the value or a property of SYM in place.
 The symbol's own value is offered under the name `value' when SYM
-is bound.  Editing a property with a container value descends
-into it, and that container edits itself in place; leaf values
-are read back as Lisp objects and stored with `put', after which
+is bound.  The chosen value is edited by `ei-edit--value': an
+in-place container edits itself, and a new list or leaf value is
+stored with `set' or `put'; after a `put',
 `ei-after-set-property' runs.  SYM is returned unchanged so that
 a place holding SYM keeps holding it, exactly like the other
-in-place containers."
-  (let ((entries (ei-choose--symbol-entries sym)))
-    (ei-choose--read-and-handle
-      "Edit property of symbol: " entries
-      (lambda (choice _new-history)
-        (let ((prop (cdr (assoc choice entries))))
-          (cond
-           ((eq prop 'value)
-            (set sym (ei-edit (symbol-value sym)))
-            sym)
-           (prop
-            (let ((old (plist-get (symbol-plist sym) prop)))
-              (if (ei-choose--container-kind old)
-                  (ei-edit old)
-                (let ((new (read-from-minibuffer
-                            "Set value: "
-                            (and old (prin1-to-string old))
-                            nil t)))
+in-place containers.
+
+The constants `t' and `nil' and all keywords are leaves instead:
+they cannot be `set', so a replacement is read and returned for
+the place holding them."
+  (if (ei-choose--constant-symbol-p sym)
+      (read-from-minibuffer "Set value: " (prin1-to-string sym) nil t)
+    (let ((entries (ei-choose--symbol-entries sym)))
+      (ei-read
+        "Edit property of symbol: " entries
+        (lambda (choice new-history)
+          (let ((prop (cdr (assoc choice entries))))
+            (cond
+             ((eq prop 'value)
+              (pcase-let ((`(,store . ,new)
+                           (ei-edit--value (symbol-value sym)
+                                           "Set value: " new-history)))
+                (when store
+                  (set sym new)))
+              sym)
+             (prop
+              (pcase-let ((`(,store . ,new)
+                           (ei-edit--value (get sym prop)
+                                           "Set value: " new-history)))
+                (when store
                   (put sym prop new)
-                  (ei-after-set-property sym prop new))))
-            sym)
-           (t nil))))
-      :object sym :path ei-current-path
-      :history-list history-list
-      :require-match t
-      :annotation (ei-choose--annotator sym))))
+                  (ei-after-set-property sym prop new)))
+              sym)
+             (t nil))))
+        :object sym :path ei-current-path
+        :history-list history-list
+        :require-match t
+        :annotation (ei-annotator sym)))))
 
 (cl-defmethod ei-edit ((object eieio-default-superclass)
-                       &key history-list &allow-other-keys)
+                        &key history-list &allow-other-keys)
   "Choose a slot of OBJECT and edit its value.
-Descend into container-valued slots with `ei-edit'; those write
-their changes themselves, so the slot keeps holding them.  A leaf
-value's edit result, and the new list handed over by a list
-through `ei-edit--store-back', are written back through
+The value is edited by `ei-edit--value': in-place containers
+write their changes themselves, so the slot keeps holding them,
+and a new list or leaf value is written back through
 `ei-choose--set-slot-value', which guards against replacing a
-slot by a value of an incompatible type."
+slot by a value of an incompatible type.  Return the result of
+the edit."
   (let ((entries (ei-choose--class-slots object)))
-    (ei-choose--read-and-handle
+    (ei-read
       (format "Edit slot of %s: " (eieio-object-class object))
       entries
       (lambda (choice new-history)
         (let* ((slot (cdr (assoc choice entries)))
                (slot-name (and slot (oref slot name))))
           (when (and slot-name (slot-boundp object slot-name))
-            (let* ((val (slot-value object slot-name))
-                   (ei-current-path
-                    (cons (cons object slot-name)
-                          ei-current-path))
-                   (ei-edit--store-back nil)
-                   (new (ei-edit val :history-list new-history))
-                   ;; In-place containers write themselves; leaves
-                   ;; report their new value, lists hand it over
-                   ;; through `ei-edit--store-back'.
-                   (replacement (or ei-edit--store-back
-                                    (and (not (ei-choose--container-kind
-                                               val))
-                                         new))))
-              (when replacement
-                (ei-choose--set-slot-value object slot-name replacement))
-              new))))
+            (let ((ei-current-path
+                   (cons (cons object slot-name)
+                         ei-current-path)))
+              (pcase-let ((`(,store . ,new)
+                           (ei-edit--value
+                            (slot-value object slot-name)
+                            (format "Set `%s' to: " slot-name)
+                            new-history)))
+                (when store
+                  (ei-choose--set-slot-value object slot-name new))
+                new)))))
       :object object :path ei-current-path
       :history-list history-list
       :require-match t
-      :annotation (ei-choose--annotator object))))
+      :annotation (ei-annotator object))))
+
+(cl-defmethod ei-edit ((table hash-table) &key history-list
+                       &allow-other-keys)
+  "Choose a key of TABLE and edit its value.
+The value is edited by `ei-edit--value': in-place containers
+write their changes themselves, and a new list or leaf value is
+stored under the key.  Return the result of the edit."
+  (let ((entries (ei-choose--hash-entries table)))
+    (ei-read
+      "Edit key: " (mapcar #'car entries)
+      (lambda (choice new-history)
+        (when-let* ((entry (assoc choice entries)))
+          (let* ((key (cdr entry))
+                 (ei-current-path
+                  (cons (cons table key) ei-current-path)))
+            (pcase-let ((`(,store . ,new)
+                         (ei-edit--value (gethash key table)
+                                         (format "Set `%s' to: " choice)
+                                         new-history)))
+              (when store
+                (puthash key new table))
+              new))))
+      :object table :path ei-current-path
+      :history-list history-list
+      :require-match t
+      :annotation (ei-annotator table))))
 
 (cl-defmethod ei-edit ((lst list) &key _history-list &allow-other-keys)
   "Edit LST by printing it in the minibuffer and reading it back.
@@ -545,6 +667,14 @@ place owning LST can install it."
                                    nil t)))
     (setq ei-edit--store-back new)
     new))
+
+(cl-defmethod ei-edit (object &key _history-list &allow-other-keys)
+  "Read a replacement for the atom OBJECT and return it.
+Atoms without a dedicated method --- numbers, characters, markers
+and the like --- are leaves of the choice tree: the replacement
+is read as a Lisp object with the current value as the default
+and returned for the place holding OBJECT."
+  (read-from-minibuffer "Set value: " (prin1-to-string object) nil t))
 
 (cl-defgeneric ei-check (ob ele &rest args)
   "Validate a prospective element ELE for insertion into OB.
@@ -560,7 +690,8 @@ If NAME already exists in ARRAY as a symbol with a value, prompt
 the user to overwrite, choose a different name, or rebind the
 existing entry.  Returns the (possibly changed) name."
   (let* ((sym-in-table (intern-soft name array))
-         (val (and sym-in-table (symbol-value sym-in-table))))
+         (val (and sym-in-table (boundp sym-in-table)
+                   (symbol-value sym-in-table))))
     (if sym-in-table
         (pcase (car (read-multiple-choice
                      (format "%s for %s taken by %s. Overwrite?" name object val)
@@ -579,7 +710,7 @@ existing entry.  Returns the (possibly changed) name."
                                       :history-list history-list))
                     (new (ei-check array (car choice)
                                    :history-list (cdr choice)))
-                    (new-sym (intern new)))
+                    (new-sym (intern new array)))
                  (set new-sym val)
                  name)))
       name)))

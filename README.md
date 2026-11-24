@@ -20,6 +20,10 @@ Emacs 30.1+.
 - `ei-edit-buffer` provides generic recursive-edit buffers for
   editing many entries at once (`C-c C-c` finish, `C-c C-k`
   cancel).
+- `ei-read` and `ei-read-choice` read one entry of a container
+  with all of the above; `ei-annotator` returns the annotation
+  function to pass them.  Use these to build your own commands
+  and methods on the interface.
 - Extension points: specialize `ei-actions`, `ei-extra-actions`
   (context-dependent actions reached through the choice path),
   `ei-object-info`, `ei-candidate-annotation`, `ei-candidate-info`,

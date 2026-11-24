@@ -45,6 +45,16 @@
             :documentation "An obarray-valued slot, unbound by default."))
   :documentation "Test class for the choice interface.")
 
+(defclass ei-tests--options ()
+  ((complete-between-morphs?
+    :initarg :complete-between-morphs? :initform t :type boolean
+    :documentation "A boolean slot, t by default.")
+   (limit :initarg :limit :initform 3
+          :documentation "A number slot.")
+   (mode :initarg :mode :initform :fast
+         :documentation "A keyword-valued slot."))
+  :documentation "Test class for leaf-valued slots of the choice interface.")
+
 (ert-deftest ei-choose-list-chars ()
   "Choosing from a list of chars returns the selected char."
   (cl-letf (((symbol-function 'completing-read)
@@ -326,11 +336,21 @@ buffer staying current."
   (should (equal (ei-choose--list-entry-element '(?a ?b) "c") ?c))
   (should (equal (ei-choose--list-entry-element '(a b) "c") 'c)))
 
+(ert-deftest ei-list-entry-element-unreadable ()
+  "Input with no Lisp reading names no element instead of signaling.
+A bare RET reads as the empty string; unbalanced input cannot be
+read at all.  Both must return nil rather than raise `end-of-file'
+out of the reader (which used to abort whole interactive commands
+with a cryptic \"End of file during parsing\")."
+  (should (null (ei-choose--list-entry-element '(a b) "")))
+  (should (null (ei-choose--list-entry-element '(a b) "(foo")))
+  (should (null (ei-choose--list-entry-element '(a b) "\"foo"))))
+
 (ert-deftest ei-read-choice-returns-choice ()
   "The read wrapper hands back the chosen entry's name."
   (cl-letf (((symbol-function 'completing-read)
              (lambda (&rest _args) "two")))
-    (should (equal (ei-choose--read-choice "Pick: " '("one" "two"))
+    (should (equal (ei-read-choice "Pick: " '("one" "two"))
                    "two"))))
 
 (ert-deftest ei-delete-obarray ()
@@ -434,6 +454,48 @@ replaced the slot."
       (ei-edit obj :history-list nil)
       (should (eq (oref obj entries) oa))
       (should (equal (symbol-value sym) "w")))))
+
+(ert-deftest ei-edit-eieio-boolean-slot-to-nil ()
+  "Editing a boolean slot from t to nil stores the nil.
+Regression: descending into the constant t with the symbol method
+of `ei-edit' asked for t's properties, and selecting `value'
+descended into t again, looping forever."
+  (let ((obj (ei-tests--options)))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "complete-between-morphs?"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) nil)))
+      (ei-edit obj :history-list nil)
+      (should (null (oref obj complete-between-morphs?))))))
+
+(ert-deftest ei-edit-eieio-number-slot-reads-replacement ()
+  "Editing a number slot reads a replacement and stores it."
+  (let ((obj (ei-tests--options :limit 3)))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "limit"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) 10)))
+      (should (equal (ei-edit obj :history-list nil) 10))
+      (should (equal (oref obj limit) 10)))))
+
+(ert-deftest ei-edit-eieio-keyword-slot-reads-replacement ()
+  "Editing a keyword-valued slot replaces the keyword."
+  (let ((obj (ei-tests--options)))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "mode"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) ':slow)))
+      (ei-edit obj :history-list nil)
+      (should (eq (oref obj mode) :slow)))))
+
+(ert-deftest ei-edit-constant-symbol-is-leaf ()
+  "Editing a constant symbol reads a replacement instead of looping."
+  (let ((replacements '(nil nil :slow)))
+    (cl-letf (((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) (pop replacements))))
+      (should (null (ei-edit t)))
+      (should (null (ei-edit nil)))
+      (should (eq (ei-edit :fast) :slow)))))
 
 ;;; Backward navigation
 
@@ -636,6 +698,30 @@ output file, capturing the compiler's log in a private buffer."
 
 ;;; Prompt hints
 
+(ert-deftest ei-prompt-hint-automatic-matches-stock ()
+  "With only the stock bindings, the automatic hint names them."
+  (should (equal (ei-choose--default-prompt-hint)
+                 "[M-a actions, M-h info, M-, back] ")))
+
+(ert-deftest ei-prompt-hint-prefers-added-bindings ()
+  "The automatic hint advertises added bindings over the stock keys.
+Daselt adds bindings for its keyboard layout to
+`ei-choose-minibuffer-map'; those, not M-a and friends, must be
+shown in the minibuffer."
+  (unwind-protect
+      (progn
+        (define-key ei-choose-minibuffer-map (kbd "C-🤔")
+                    #'ei-choose-actions)
+        (define-key ei-choose-minibuffer-map (kbd "C-😔")
+                    #'ei-choose-describe-candidate)
+        (define-key ei-choose-minibuffer-map (kbd "C-😭")
+                    #'ei-choose-back)
+        (should (equal (ei-choose--default-prompt-hint)
+                       "[C-🤔 actions, C-😔 info, C-😭 back] ")))
+    (define-key ei-choose-minibuffer-map (kbd "C-🤔") nil)
+    (define-key ei-choose-minibuffer-map (kbd "C-😔") nil)
+    (define-key ei-choose-minibuffer-map (kbd "C-😭") nil)))
+
 (ert-deftest ei-prompt-hint-appended ()
   "Every read of the interface advertises the interface keys.
 The hint is appended once, after the prompt, and separated by a
@@ -719,6 +805,285 @@ row carries the bold face, and every slot appears in it."
 suffix
 "))))
 
+
+;;; Hash tables, place edits and resuming actions
+
+(ert-deftest ei-add-hash-table ()
+  "Adding to a hash table stores the read key and value."
+  (let ((table (make-hash-table :test #'equal)))
+    (puthash "a" 1 table)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "b"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) 2)))
+      (should (equal (ei-add table) "b"))
+      (should (equal (gethash "b" table) 2)))
+    (should (equal (ei-add table :key "c" :value nil) "c"))
+    (should (member "c" (hash-table-keys table)))))
+
+(ert-deftest ei-hash-entry-key-follows-key-type ()
+  "A new key is a string, a symbol or a read object like its peers."
+  (let ((strings (make-hash-table :test #'equal))
+        (symbols (make-hash-table))
+        (empty (make-hash-table)))
+    (puthash "a" 1 strings)
+    (puthash 'a 1 symbols)
+    (should (equal (ei-choose--hash-entry-key strings "b") "b"))
+    (should (eq (ei-choose--hash-entry-key symbols "a") 'a))
+    (should (eq (ei-choose--hash-entry-key symbols "b") 'b))
+    (should (equal (ei-choose--hash-entry-key empty "7") 7))
+    (should-not (ei-choose--hash-entry-key empty ""))))
+
+(ert-deftest ei-delete-hash-table ()
+  "Deleting from a hash table removes the chosen key."
+  (let ((table (make-hash-table)))
+    (puthash 'a 1 table)
+    (puthash 'b 2 table)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "a")))
+      (should (eq (ei-delete table) table))
+      (should (equal (hash-table-keys table) '(b))))))
+
+(ert-deftest ei-edit-hash-table-leaf-and-list ()
+  "Editing a hash-table value stores new leaves and new lists."
+  (let ((table (make-hash-table)))
+    (puthash 'n 1 table)
+    (puthash 'l '(1 2) table)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "n"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) 5)))
+      (ei-edit table)
+      (should (equal (gethash 'n table) 5)))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "l"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) nil)))
+      (ei-edit table)
+      (should (equal (gethash 'l table 'missing) nil)))))
+
+(ert-deftest ei-edit-eieio-list-slot-to-empty ()
+  "A list slot can be edited down to the empty list."
+  (let ((obj (ei-tests--object :items '(1 2))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "items"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) nil)))
+      (ei-edit obj :history-list nil)
+      (should (null (oref obj items))))))
+
+(ert-deftest ei-edit-eieio-symbol-slot-replaced ()
+  "A slot holding a plain symbol reads a replacement for it."
+  (let ((obj (ei-tests--options :mode (make-symbol "plain"))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "mode"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) 'other)))
+      (ei-edit obj :history-list nil)
+      (should (eq (oref obj mode) 'other)))))
+
+(ert-deftest ei-edit-value-symbol-with-properties-asks ()
+  "A symbol with properties is replaced or edited in itself."
+  (let ((sym (make-symbol "with-props")))
+    (put sym 'p 1)
+    (cl-letf (((symbol-function 'read-multiple-choice)
+               (lambda (&rest _args) '(?r "replace")))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) 'other)))
+      (should (equal (ei-edit--value sym "Set: " nil) '(t . other))))
+    (cl-letf (((symbol-function 'read-multiple-choice)
+               (lambda (&rest _args) '(?p "properties")))
+              ((symbol-function 'completing-read)
+               (lambda (&rest _args) "p"))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (&rest _args) 2)))
+      (should (equal (ei-edit--value sym "Set: " nil) (cons nil sym)))
+      (should (equal (get sym 'p) 2)))))
+
+(ert-deftest ei-edit-symbol-list-property-stored ()
+  "Editing a list-valued property stores the new list and runs the hook."
+  (let ((sym (intern "ei-tests--list-prop-symbol"))
+        (seen nil))
+    (unwind-protect
+        (progn
+          (put sym 'seq '(a b))
+          (cl-defmethod ei-after-set-property
+            ((_s (eql ei-tests--list-prop-symbol)) prop new)
+            (push (list prop new) seen))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) "seq"))
+                    ((symbol-function 'read-from-minibuffer)
+                     (lambda (&rest _args) '(c))))
+            (ei-edit sym :history-list nil)
+            (should (equal (get sym 'seq) '(c)))
+            (should (equal seen '((seq (c)))))))
+      (unintern sym obarray))))
+
+(ert-deftest ei-edit-symbol-container-value-kept ()
+  "Editing a symbol whose value is an obarray keeps the obarray."
+  (let* ((oa (obarray-make))
+         (inner (intern "foo" oa))
+         (sym (make-symbol "holder"))
+         (completions '("value" "foo")))
+    (set inner "old")
+    (set sym oa)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) (pop completions)))
+              ((symbol-function 'read-string)
+               (lambda (&rest _args) "new")))
+      (ei-edit sym :history-list nil)
+      (should (eq (symbol-value sym) oa))
+      (should (equal (symbol-value inner) "new")))))
+
+(ert-deftest ei-check-obarray-rebind-stays-in-obarray ()
+  "Rebinding moves the old value to a new name in the same obarray."
+  (let* ((oa (obarray-make))
+         (sym (intern "foo" oa)))
+    (set sym "v")
+    (cl-letf (((symbol-function 'read-multiple-choice)
+               (lambda (&rest _args) '(?r "rebind")))
+              ((symbol-function 'completing-read)
+               (lambda (&rest _args) "ei-tests--rebound-name")))
+      (should (equal (ei-check oa "foo") "foo"))
+      (should (equal (symbol-value (intern-soft "ei-tests--rebound-name" oa))
+                     "v"))
+      (should-not (intern-soft "ei-tests--rebound-name" obarray)))))
+
+(ert-deftest ei-check-obarray-unbound-symbol ()
+  "A name interned without a value is checked without an error."
+  (let ((oa (obarray-make)))
+    (intern "foo" oa)
+    (cl-letf (((symbol-function 'read-multiple-choice)
+               (lambda (&rest _args) '(?y "overwrite"))))
+      (should (equal (ei-check oa "foo") "foo")))))
+
+(ert-deftest ei-actions-menu-resume-action-does-not-exit ()
+  "A `:resume' action runs in place; other actions throw out of the read."
+  (let* ((ran nil)
+         (actions (list (list ?x "stay" (lambda (ob) (setq ran ob)) :resume)
+                        (list ?y "leave" #'identity)))
+         (map (car (ei-choose--actions-menu actions 'obj nil))))
+    (should (eq (catch 'ei-choose-action
+                  (funcall (lookup-key map [?x]))
+                  'stayed)
+                'stayed))
+    (should (eq ran 'obj))
+    (should (equal (catch 'ei-choose-action
+                     (funcall (lookup-key map [?y]))
+                     'stayed)
+                   (list :action #'identity 'obj nil)))))
+
+(ert-deftest ei-annotator-indexes-entries-once ()
+  "Annotating many candidates lists the container's entries once."
+  (let ((table (make-hash-table))
+        (calls 0))
+    (puthash 'a 1 table)
+    (puthash 'b 2 table)
+    (let ((annotate (ei-annotator table))
+          (orig (symbol-function 'ei-choose--hash-entries)))
+      (cl-letf (((symbol-function 'ei-choose--hash-entries)
+                 (lambda (tbl) (cl-incf calls) (funcall orig tbl))))
+        (should (string-match-p "1" (funcall annotate "a")))
+        (should (string-match-p "2" (funcall annotate "b")))
+        (should-not (funcall annotate "missing"))
+        (should (= calls 1))))))
+
+(ert-deftest ei-short-stops-printing-early ()
+  "The short form is cut at the width without printing everything."
+  (should (equal (ei-choose--short "abc" 5) "abc"))
+  (should (equal (ei-choose--short "abcdef" 5) "abcd…"))
+  (should (equal (ei-choose--short "a\nb" 5) "a b"))
+  (let ((printed 0))
+    (cl-letf (((symbol-function 'princ)
+               (let ((orig (symbol-function 'princ)))
+                 (lambda (object fn)
+                   (funcall orig object
+                            (lambda (ch) (cl-incf printed) (funcall fn ch)))))))
+      (ei-choose--short (make-list 10000 'x) 10))
+    (should (< printed 20))))
+
+(ert-deftest ei-list-action-stores-in-owner ()
+  "A list action from the menu installs the new list in its owner."
+  (let* ((obj (ei-tests--object :items '("a" "b" "c")))
+         (lst (oref obj items))
+         (table (make-hash-table))
+         (delete (nth 2 (assq ?d (ei-actions lst)))))
+    (puthash 'k lst table)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "b")))
+      (let ((ei-current-path (list (cons obj 'items))))
+        (funcall delete lst))
+      (should (equal (oref obj items) '("a" "c")))
+      (let ((ei-current-path (list (cons table 'k))))
+        (funcall delete lst))
+      (should (equal (gethash 'k table) '("a" "c")))
+      ;; Without an owning place nothing is written.
+      (let ((ei-current-path nil))
+        (should (equal (funcall delete lst) '("a" "c"))))
+      (should (equal lst '("a" "b" "c"))))))
+
+(ert-deftest ei-prompt-breadcrumb ()
+  "Prompts of a descent name the entries chosen on the way."
+  (let ((ei-choose-prompt-hint nil)
+        (obj (ei-tests--object :name "thing")))
+    (should (equal (ei-choose--prompt "Key: " nil) "Key: "))
+    (should (equal (ei-choose--prompt "Key: "
+                                      (list (cons '(x) obj)
+                                            (cons obj 'items)))
+                   "Key: (items › thing) "))
+    (should (equal (ei-choose--prompt
+                    "Key: " '((d . 4) (c . 3) (b . 2) (a . 1)))
+                   "Key: (… › 2 › 3 › 4) "))))
+
+(ert-deftest ei-annotated-table-metadata ()
+  "The completion table has a category and aligned affixations."
+  (let* ((table (ei-choose--annotated-table
+                 '("a" "long")
+                 (lambda (cand) (and (equal cand "a") "  note"))))
+         (metadata (funcall table "" nil 'metadata))
+         (affix (alist-get 'affixation-function (cdr metadata))))
+    (should (eq (alist-get 'category (cdr metadata)) 'ei-entry))
+    (should (functionp (alist-get 'annotation-function (cdr metadata))))
+    (should (equal (funcall affix '("a" "long"))
+                   '(("a" "" "     note") ("long" "" ""))))
+    (should (equal (all-completions "l" table) '("long")))))
+
+(ert-deftest ei-default-reader-keeps-choice-history ()
+  "The default reader does not use the threaded history as its own."
+  (let ((ei-current-choice-history '(marker))
+        (seen nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_p _c _pred _rm _init hist &rest _) (setq seen hist)
+                 "a")))
+      (ei-choose--default-completing-read "P: " '("a")))
+    (should (eq seen 'ei-choose-minibuffer-history))
+    (should (equal ei-current-choice-history '(marker)))))
+
 (provide 'ei-generics-tests)
 
 ;;; ei-generics-tests.el ends here
+
+(ert-deftest ei-add-list-of-objects-threads-history ()
+  "The element read of `ei-add' on named objects keeps the history.
+The internal `ei-choose' receives the HISTORY-LIST of the caller,
+so a history-aware reader keys the element read at the caller's
+node instead of the root, and the re-entry into the chosen object
+continues from the caller's history list."
+  (let* ((obj1 (ei-tests--object :name "one"))
+         (obj2 (ei-tests--object :name "two"))
+         (reads nil))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (_prompt &optional _init &rest _) "renamed")))
+      (let ((ei-completing-read-function
+             (cl-function
+              (lambda (prompt _table &key history-list &allow-other-keys)
+                (push (cons prompt history-list) reads)
+                (let ((choice (if (string-prefix-p "Element" prompt)
+                                  "one" "name")))
+                  (cons choice (append history-list
+                                       (list choice))))))))
+        (ei-add (list obj1 obj2) :history-list '("node"))))
+    (should (equal (cdr (cl-assoc "Element" reads :test #'string-prefix-p))
+                   '("node")))
+    (should (equal (cdr (cl-assoc "Edit slot" reads :test #'string-prefix-p))
+                   '("node")))))

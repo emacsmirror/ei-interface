@@ -27,7 +27,11 @@
 ;; for builtin types, and the completion read machinery.
 ;;
 ;; The interface reads one entry of a container through the
-;; minibuffer, with these keys active:
+;; minibuffer, with these keys active (their stock bindings in
+;; `ei-choose-minibuffer-map'; a keyboard-layout system such as
+;; Daselt adds its own bindings to that map, and the prompt hint
+;; and the action menu then advertise those instead, see
+;; `ei-choose-prompt-hint'):
 ;;
 ;; - M-a (also M-\\) opens the action menu, a help screen built
 ;;   with `make-help-screen' from the entries of `ei-actions'.
@@ -57,17 +61,17 @@
 (declare-function ei-delete "ei-generics")
 (declare-function ei-edit "ei-generics")
 
-(defvar ei-property-history nil
-  "History of variable properties.
-
-Used for minibuffer completion of property names in `ei-edit'
-and `ei-choose' methods.")
+(defvar ei-choose-minibuffer-history nil
+  "Minibuffer history of `ei-choose--default-completing-read'.")
 
 (defvar ei-current-choice-history nil
-  "History of choices in the current choice-run.
-
-Used by `ei-choose' methods to record the sequence of choices
-made during a single interactive session.")
+  "History list of the choice read in progress.
+This is the value threaded through the reads of a choice run as
+their `:history-list': what it holds is up to the reader in
+`ei-completing-read-function', which may keep it current, for
+instance as the list of the choices made so far.  The actions of
+the menu pass it on as the `:history-list' of the operation they
+start.  The default reader leaves it alone.")
 
 (defvar ei-current-object nil
   "The object currently being chosen in.")
@@ -83,7 +87,7 @@ currently chosen in.")
 
 (defvar ei-choose--tag-stack nil
   "Catch tags of the active choice reads, innermost first.
-`ei-choose--read' pushes one tag per active read level;
+`ei-read' pushes one tag per active read level;
 `ei-choose-back' throws to the second entry, the tag of the
 parent read, to resume the descent one level up.")
 
@@ -93,12 +97,14 @@ value to their caller.
 
 Methods on in-place containers (EIEIO objects, obarrays, hash
 tables, symbols) write their changes themselves and leave this
-nil.  Methods on value containers (lists) compute a fresh list,
+alone.  Methods on value containers (lists) compute a fresh list,
 store it in this variable and return it; a caller that holds the
-edited list in a place of its own rebinds this variable to nil
-around the recursive edit, checks it afterwards and installs the
-new list.  This protocol keeps every write at the level that owns
-the edited place.")
+edited list in a place of its own rebinds this variable to a
+non-list marker around the recursive edit, checks it afterwards
+and installs the list found there, see `ei-edit--value'.  The
+marker rather than nil stands for \"nothing handed over\", because
+nil is the empty list, a legitimate new value.  This protocol
+keeps every write at the level that owns the edited place.")
 
 (defvar ei-choose-minibuffer-map
   (let ((map (make-sparse-keymap)))
@@ -115,7 +121,15 @@ context-dependent actions of `ei-actions'); M-h describes the
 entry currently named in the minibuffer via `ei-candidate-info';
 M-, goes back to the previous container of the descent via
 `ei-choose-back'.  Candidates are annotated with type information
-through `ei-candidate-annotation'.")
+through `ei-candidate-annotation'.
+
+These are the stock bindings; a keyboard-layout system such as
+Daselt adds its own bindings to this map (through its bindlists),
+and the prompt hint of `ei-choose-prompt-hint' and the action
+menu then advertise those instead.  The map is composed over
+whatever local map the minibuffer read installs, so bindings in
+it are active during every choice completion without being
+affected by the minibuffer maps themselves.")
 
 (defun ei-choose-back ()
   "Go back to the previous container of the choice descent.
@@ -150,7 +164,7 @@ Return (CHOICE . HISTORY-LIST) with the chosen entry as a
 string."
   (cons (substring-no-properties
          (completing-read prompt table nil require-match
-                          nil 'ei-current-choice-history
+                          nil 'ei-choose-minibuffer-history
                           initial-input))
         history-list))
 
@@ -165,18 +179,19 @@ Dynamically rebound from `ei-actions' every time the menu opens;
 consumed by `ei-choose--action-screen'.")
 
 (make-help-screen ei-choose--action-screen
-  "Action: (? for help)"
+  "Action: (SPC/DEL to scroll, q to quit)"
   ei-choose--help-text
   ei-choose--actions-keymap
   "*ei-choose-actions*")
 
 (defun ei-choose-actions ()
   "Open the action menu of the object currently chosen in.
-The menu is a help screen in the style of `make-help-screen':
-press ? to list all actions with their keys, press one of the
-action keys to run that action, or press q to return to the
-completion.  The actions are the context-dependent entries of
-`ei-actions' for `ei-current-object'."
+The menu is a help screen in the style of `make-help-screen' that
+lists all actions with their keys right away: press one of the
+action keys to run that action, scroll the list with SPC and
+DEL, or press q to return to the completion.  The actions are
+the context-dependent entries of `ei-actions' for
+`ei-current-object'."
   (interactive)
   (when ei-current-object
     (let* ((obj ei-current-object)
@@ -184,6 +199,10 @@ completion.  The actions are the context-dependent entries of
            (menu (ei-choose--actions-menu (ei-actions obj) obj path)))
       (setq ei-choose--actions-keymap (car menu)
             ei-choose--help-text (cdr menu))
+      ;; A help screen only lists its commands once the help key is
+      ;; pressed; press it for the user, so the actions are visible
+      ;; from the start.
+      (push ?? unread-command-events)
       (ei-choose--action-screen))))
 
 (defun ei-choose--actions-menu (actions object path)
@@ -191,23 +210,30 @@ completion.  The actions are the context-dependent entries of
 ACTIONS is a list of (KEY LABEL FUNCTION) entries as returned by
 `ei-actions'; PATH is the choice path leading to OBJECT.  Keys
 already taken are reassigned to the next free character; q and
-C-g always quit the menu and resume the completion."
+C-g always quit the menu and resume the completion.  An action
+ends the choice and its result becomes the result of the read,
+except for entries marked `:resume', which run inside the
+minibuffer and leave the completion active."
   (let* ((map (make-sparse-keymap))
          (taken (make-hash-table))
          (rows nil))
     (puthash ?q t taken)
     (puthash ?\C-g t taken)
     (dolist (action actions)
-      (pcase-let ((`(,key ,label ,fn) action))
+      (pcase-let ((`(,key ,label ,fn ,resume) action))
         (when (and (characterp key) (functionp fn))
           (let ((ch key))
             (while (gethash ch taken) (setq ch (1+ ch)))
             (puthash ch t taken)
             (define-key map (vector ch)
-                        (lambda ()
+                        (if (eq resume :resume)
+                            (lambda ()
+                              (interactive)
+                              (funcall fn object))
+                          (lambda ()
                             (interactive)
                             (throw 'ei-choose-action
-                                  (list :action fn object path))))
+                                   (list :action fn object path)))))
             (push (cons ch label) rows)))))
     (dolist (ch '(?q ?\C-g))
       (define-key map (vector ch)
@@ -221,12 +247,18 @@ C-g always quit the menu and resume the completion."
   "Format the help screen listing ROWS, the actions on OBJECT.
 PATH is the choice path leading to OBJECT; it is shown so that
 the user can see the context the actions apply to."
-  (with-temp-buffer
+  (let ((actions-key (ei-choose--command-key 'ei-choose-actions))
+        (info-key (ei-choose--command-key 'ei-choose-describe-candidate))
+        (back-key (ei-choose--command-key 'ei-choose-back)))
+    (with-temp-buffer
       (insert "ei choice interface\n\n")
-      (insert "RET descends into the entry chosen from the current
-object; M-a opens this action menu; M-h describes the entry
-currently named in the minibuffer; M-, goes back to the previous
-container; C-g aborts the choice.\n\n")
+      (insert (format "RET descends into the entry chosen from the current
+object; %s opens this action menu; %s describes the entry
+currently named in the minibuffer; %s goes back to the previous
+container; C-g aborts the choice.\n\n"
+                      (or actions-key "the actions key")
+                      (or info-key "the info key")
+                      (or back-key "the back key")))
       (insert (format "Current object: %s\n"
                      (ei-choose--object-summary object)))
       (when path
@@ -246,7 +278,7 @@ container; C-g aborts the choice.\n\n")
                           (cdr row))))
       (insert "  (none)\n"))
       (insert "\nq or C-g quits this menu and resumes completion.\n")
-      (buffer-string)))
+      (buffer-string))))
 
 (defun ei-choose--object-summary (object)
   "Return a short one-line description of OBJECT."
@@ -302,29 +334,108 @@ tables of `ei-object-info' readable."
   :type 'natnum
   :group 'ei)
 
-(defcustom ei-choose-prompt-hint "[M-a actions, M-h info, M-, back]"
+(defcustom ei-choose-prompt-hint t
   "Hint about the choice-interface keys appended to every prompt.
-It advertises the keys of `ei-choose-minibuffer-map': M-a opens
-the action menu of `ei-choose-actions', M-h describes the entry
-named in the minibuffer and M-, goes back to the previous
-container.  The hint is appended to the prompt of every read of
-the interface, separated by a space unless the prompt ends with
-one.  Bind it to nil or the empty string to keep the prompts
-plain."
-  :type '(choice (const :tag "No hint" nil)
-                 (string :tag "Hint"))
+With t (the default) the hint is computed from the keys currently
+bound in `ei-choose-minibuffer-map', preferring bindings other
+than the stock ones, so that a keyboard-layout system such as
+Daselt that adds its own bindings to the map displays the keys
+that are actually used.  A string is used verbatim; bind it to nil
+or the empty string to keep the prompts plain."
+  :type '(choice (const :tag "Automatic from the key bindings" t)
+                 (string :tag "Hint text")
+                 (const :tag "No hint" nil))
   :group 'ei)
 
-(defun ei-choose--prompt (prompt)
-  "Return PROMPT with `ei-choose-prompt-hint' appended when set.
-The hint is separated from PROMPT by a space unless PROMPT ends
-with one already."
-  (if (or (null ei-choose-prompt-hint)
-          (string-empty-p ei-choose-prompt-hint))
-      prompt
-    (if (string-match-p "[ \t]$" prompt)
-        (concat prompt ei-choose-prompt-hint)
-      (concat prompt " " ei-choose-prompt-hint))))
+(defvar ei-choose--commands-and-stock-keys
+  '((ei-choose-actions "actions" ("M-a" "M-\\"))
+    (ei-choose-describe-candidate "info" ("M-h"))
+    (ei-choose-back "back" ("M-,")))
+  "Commands of `ei-choose-minibuffer-map' with their stock keys.
+Each entry is (COMMAND LABEL STOCK-KEYS): LABEL names COMMAND in
+the prompt hint and STOCK-KEYS lists the key descriptions of the
+stock bindings in `ei-choose-minibuffer-map', which
+`ei-choose--command-key' demotes in favor of any other binding.")
+
+(defun ei-choose--command-key (command)
+  "Return the key description advertising COMMAND in the hint.
+All keys bound to COMMAND in `ei-choose-minibuffer-map' are
+considered; the first one that is not among the stock keys of
+`ei-choose--commands-and-stock-keys' wins, so bindings added by a
+keyboard-layout system such as Daselt are preferred over the stock
+ones.  With only stock keys bound, the first stock key that is
+bound wins.  Return nil when COMMAND has no binding."
+  (let* ((stock (nth 2 (assq command
+                             ei-choose--commands-and-stock-keys)))
+         (bound (mapcar #'key-description
+                        (where-is-internal command
+                                           ei-choose-minibuffer-map)))
+         (key (or (cl-find-if (lambda (d) (not (member d stock)))
+                              bound)
+                  (cl-find-if (lambda (d) (member d bound))
+                              stock))))
+    key))
+
+(defun ei-choose--default-prompt-hint ()
+  "Return the hint naming the keys bound in `ei-choose-minibuffer-map'.
+Every entry of `ei-choose--commands-and-stock-keys' whose command
+has a binding contributes a \"KEY label\" item.  Return nil when
+none of the commands is bound."
+  (let ((items
+         (delq nil
+               (mapcar
+                (pcase-lambda (`(,cmd ,label ,_stock))
+                  (let ((key (ei-choose--command-key cmd)))
+                    (and key (format "%s %s" key label))))
+                ei-choose--commands-and-stock-keys))))
+    (and items (concat "[" (mapconcat #'identity items ", ") "] "))))
+
+(defun ei-choose--path-label (key)
+  "Return a short name for KEY, the entry chosen in one path step."
+  (cond ((and (eieio-object-p key)
+              (slot-exists-p key 'name)
+              (slot-boundp key 'name)
+              (slot-value key 'name))
+         (ei-choose--short (slot-value key 'name) 20))
+        ((eieio-object-p key) (format "%s" (eieio-object-class key)))
+        (t (ei-choose--short key 20))))
+
+(defun ei-choose--breadcrumb (path)
+  "Return a prompt part naming the entries chosen along PATH.
+PATH is a choice path as in `ei-current-path'.  The entries are
+named outermost first, separated by \" › \" and enclosed in
+parentheses; of a long path only the three innermost steps are
+named, behind an ellipsis.  Return nil for an empty PATH."
+  (when path
+    (let ((labels (nreverse (mapcar (lambda (step)
+                                      (ei-choose--path-label (cdr step)))
+                                    (take 3 path)))))
+      (concat "("
+              (and (nthcdr 3 path) "… › ")
+              (mapconcat #'identity labels " › ")
+              ") "))))
+
+(defun ei-choose--prompt (prompt &optional path)
+  "Return PROMPT followed by the breadcrumb of PATH and the key hint.
+The breadcrumb of `ei-choose--breadcrumb' for the choice path
+PATH follows PROMPT, so that every prompt of a descent shows
+where it is while still starting with its own text.
+`ei-choose-prompt-hint' comes last when set; a value of t
+computes the hint from the keys bound in
+`ei-choose-minibuffer-map'.  What is appended is separated from
+PROMPT by a space unless PROMPT ends with one already."
+  (let* ((hint (cond
+                ((or (null ei-choose-prompt-hint)
+                     (string-empty-p ei-choose-prompt-hint))
+                 nil)
+                ((eq ei-choose-prompt-hint t)
+                 (ei-choose--default-prompt-hint))
+                (t ei-choose-prompt-hint)))
+         (suffix (concat (ei-choose--breadcrumb path) hint)))
+    (cond
+     ((string-empty-p suffix) prompt)
+     ((string-match-p "[ \t]$" prompt) (concat prompt suffix))
+     (t (concat prompt " " suffix)))))
 
 (defun ei-choose--insert-table (rows)
   "Insert ROWS as an editable `table-mode' table at point.
@@ -461,7 +572,7 @@ generic to teach the choice interface about new container types."
 (cl-defmethod ei-candidate-annotation
     ((object eieio-default-superclass) candidate)
     "Annotate CANDIDATE with its slot type and current value."
-    (when-let* ((slot (cdr (assoc candidate (ei-choose--class-slots object)))))
+    (when-let* ((slot (ei-choose--entry object candidate)))
     (let* ((name (oref slot name))
            (type (ignore-errors (oref slot type)))
            (type-str (and type (not (eq type t)) (format "%s" type)))
@@ -475,7 +586,7 @@ generic to teach the choice interface about new container types."
                                     (ei-choose--short type-str 28)))
                   (val-str (format "  %s" val-str))
                   (t nil))))
-      (ei-choose--annotation-face text))))
+      (ei-annotation-face text))))
 
 (cl-defmethod ei-candidate-annotation ((array obarray) candidate)
     "Annotate CANDIDATE with the value bound to its symbol."
@@ -487,30 +598,30 @@ generic to teach the choice interface about new container types."
                     ((boundp sym)
                      (format "  <%s>" (type-of (symbol-value sym))))
                     (t "  #<unbound>"))))
-        (ei-choose--annotation-face text)))))
+        (ei-annotation-face text)))))
 
 (cl-defmethod ei-candidate-annotation ((table hash-table) candidate)
     "Annotate CANDIDATE with the value stored for its key."
-    (let ((key (cdr (assoc candidate (ei-choose--hash-entries table)))))
+    (let ((key (ei-choose--entry table candidate)))
     (when key
-      (ei-choose--annotation-face
+      (ei-annotation-face
        (concat "  " (ei-choose--short (gethash key table) 32))))))
 
 (cl-defmethod ei-candidate-annotation ((lst list) candidate)
     "Annotate CANDIDATE with a short form of the named element."
-    (let ((elt (cdr (assoc candidate (ei-choose--list-entries lst)))))
+    (let ((elt (ei-choose--entry lst candidate)))
     (when elt
-      (ei-choose--annotation-face
+      (ei-annotation-face
        (concat "  " (ei-choose--short elt 32))))))
 
 (cl-defmethod ei-candidate-annotation ((sym symbol) candidate)
     "Annotate CANDIDATE with the value of the named property."
-    (let ((prop (cdr (assoc candidate (ei-choose--symbol-entries sym)))))
+    (let ((prop (ei-choose--entry sym candidate)))
     (when prop
       (let ((val (if (eq prop 'value)
                           (and (boundp sym) (symbol-value sym))
                       (plist-get (symbol-plist sym) prop))))
-        (ei-choose--annotation-face
+        (ei-annotation-face
          (concat "  " (ei-choose--short val 32)))))))
 
 (cl-defgeneric ei-candidate-info (container candidate)
@@ -526,7 +637,7 @@ documentation."
 (cl-defmethod ei-candidate-info
     ((object eieio-default-superclass) candidate)
     "Document the slot of OBJECT named by CANDIDATE."
-    (if-let* ((slot (cdr (assoc candidate (ei-choose--class-slots object)))))
+    (if-let* ((slot (ei-choose--entry object candidate)))
           (let* ((name (oref slot name))
               (type (ignore-errors (oref slot type)))
               (doc (ignore-errors (alist-get :documentation
@@ -575,7 +686,7 @@ documentation."
 
 (cl-defmethod ei-candidate-info ((table hash-table) candidate)
     "Document the key of TABLE named by CANDIDATE."
-    (let ((key (cdr (assoc candidate (ei-choose--hash-entries table)))))
+    (let ((key (ei-choose--entry table candidate)))
     (if (not key)
             (cl-call-next-method)
         (format "%s is a key of this hash table.\n\nValue: %s"
@@ -583,7 +694,7 @@ documentation."
 
 (cl-defmethod ei-candidate-info ((lst list) candidate)
     "Document the element of LST named by CANDIDATE."
-    (let ((elt (cdr (assoc candidate (ei-choose--list-entries lst)))))
+    (let ((elt (ei-choose--entry lst candidate)))
     (if (not elt)
             (cl-call-next-method)
         (format "%s is an element of a list of %d elements.\n\nValue: %s"
@@ -591,7 +702,7 @@ documentation."
 
 (cl-defmethod ei-candidate-info ((sym symbol) candidate)
   "Document the property of SYM named by CANDIDATE."
-  (let ((prop (cdr (assoc candidate (ei-choose--symbol-entries sym)))))
+  (let ((prop (ei-choose--entry sym candidate)))
     (if (not prop)
         (cl-call-next-method)
       (format "%s is %s of the symbol %s.\n\nValue: %s"
@@ -611,13 +722,19 @@ The return value is a list of entries (KEY LABEL FUNCTION): KEY
 is the character selecting the action in the menu opened by
 `ei-choose-actions', LABEL is a short description shown in the
 menu's help screen, and FUNCTION is called with OBJECT when the
-action runs.  While an action runs, the dynamic variables
+action runs.  Running an action ends the choice.  An entry of
+the form (KEY LABEL FUNCTION :resume) instead runs FUNCTION while
+the minibuffer stays active, so the choice continues afterwards;
+use it for actions that only display something and neither
+change OBJECT nor read from the minibuffer.  While an action
+runs, the dynamic variables
 `ei-current-object' and `ei-current-path' describe the choice
 context.  Specializations should append their own entries to
 `cl-call-next-method' so that the actions of all applicable
 specializations compose; context-dependent commands arrive
 through `ei-extra-actions'."
-  (list (list ?i "Inspect the object" #'ei-choose--inspect-object)))
+  (list (list ?i "Inspect the object" #'ei-choose--inspect-object
+              :resume)))
 
 (cl-defmethod ei-actions ((object eieio-default-superclass))
   "Basic editing actions for EIEIO objects."
@@ -697,43 +814,129 @@ The default method returns no extra actions."
                  (ei-edit ob :history-list ei-current-choice-history))))
    (cl-call-next-method str)))
 
+(defun ei-choose--list-action (operation)
+  "Return an action running OPERATION on the list chosen in.
+OPERATION is `ei-edit', `ei-add' or `ei-delete'.  Lists are value
+containers: OPERATION hands the new list over through
+`ei-edit--store-back', and the action installs it in the place
+the list was reached through, the innermost step of
+`ei-current-path'.  That place is a slot of an EIEIO object or a
+value of a hash table; a list reached any other way has no place
+the action could write, and a message says so."
+  (lambda (lst)
+    (let* ((ei-edit--store-back 'unset)
+           (result (funcall operation lst
+                            :history-list ei-current-choice-history)))
+      (when (listp ei-edit--store-back)
+        (pcase (car ei-current-path)
+          ((and `(,owner . ,slot)
+                (guard (and (eieio-object-p owner)
+                            (symbolp slot)
+                            (slot-exists-p owner slot)
+                            (slot-boundp owner slot)
+                            (eq (slot-value owner slot) lst))))
+           (ei-choose--set-slot-value owner slot ei-edit--store-back))
+          ((and `(,owner . ,key)
+                (guard (and (hash-table-p owner)
+                            (eq (gethash key owner) lst))))
+           (puthash key ei-edit--store-back owner))
+          (_ (message "ei: the changed list is not held by a slot or \
+hash-table value; nothing was stored"))))
+      result)))
+
 (cl-defmethod ei-actions ((lst list))
-  "Editing actions for lists."
+  "Editing actions for lists.
+The actions store the changed list in the place owning it, see
+`ei-choose--list-action'."
   (append
-   (list (list ?e "Edit the list"
-               (lambda (ob)
-                 (ei-edit ob :history-list ei-current-choice-history)))
-         (list ?a "Add an element"
-               (lambda (ob)
-                 (ei-add ob :history-list ei-current-choice-history)))
-         (list ?d "Delete an element"
-               (lambda (ob)
-                 (ei-delete ob :history-list ei-current-choice-history))))
+   (list (list ?e "Edit the list" (ei-choose--list-action #'ei-edit))
+         (list ?a "Add an element" (ei-choose--list-action #'ei-add))
+         (list ?d "Delete an element" (ei-choose--list-action #'ei-delete)))
    (ei-extra-actions lst ei-current-path)
    (cl-call-next-method lst)))
 
 
-(defun ei-choose--annotator (container)
-  "Return an annotation function for the entries of CONTAINER."
-  (lambda (candidate)
-    (ei-candidate-annotation container candidate)))
+(defvar ei-choose--entry-index nil
+  "Cons (CONTAINER . TABLE) indexing CONTAINER's entries, or nil.
+TABLE maps the completion name of every entry of CONTAINER to
+what `ei-choose--entries' pairs it with.  Bound by the function
+of `ei-annotator' while it annotates, so that annotating
+all candidates of a large container does not list its entries
+once per candidate; consulted by `ei-choose--entry'.")
+
+(defun ei-choose--entries (container)
+  "Return the entries of CONTAINER as (NAME . THING) pairs.
+NAME is the completion string of an entry; THING is the slot
+descriptor for an EIEIO object, the key for a hash table, the
+element for a list and the place for a symbol.  Obarrays and
+atoms have no entry list; return nil for them."
+  (cond ((eieio-object-p container) (ei-choose--class-slots container))
+        ((hash-table-p container) (ei-choose--hash-entries container))
+        ((consp container) (ei-choose--list-entries container))
+        ((and container (symbolp container))
+         (ei-choose--symbol-entries container))))
+
+(defun ei-choose--entry (container candidate)
+  "Return what CANDIDATE names among the entries of CONTAINER.
+See `ei-choose--entries' for what that is; return nil when no
+entry is named CANDIDATE.  Of several entries with the same name
+the first one wins."
+  (if (and ei-choose--entry-index
+           (eq (car ei-choose--entry-index) container))
+      (gethash candidate (cdr ei-choose--entry-index))
+    (cdr (assoc candidate (ei-choose--entries container)))))
+
+(defun ei-annotator (container)
+  "Return an annotation function for the entries of CONTAINER.
+The function indexes the entries of CONTAINER when it is first
+called and reuses that index for every later candidate, see
+`ei-choose--entry-index'."
+  (let ((index nil))
+    (lambda (candidate)
+      (unless index
+        (let ((table (make-hash-table :test #'equal)))
+          (pcase-dolist (`(,name . ,thing) (ei-choose--entries container))
+            (unless (gethash name table)
+              (puthash name thing table)))
+          (setq index (cons container table))))
+      (let ((ei-choose--entry-index index))
+        (ei-candidate-annotation container candidate)))))
 
 (defun ei-choose--annotated-table (collection annotator)
   "Return a completion table delegating to COLLECTION.
-The table adds ANNOTATOR as its metadata annotation function, so
-that candidates carry the extra information computed by
-`ei-candidate-annotation'."
-  (lambda (string pred action)
+The table's metadata gives the candidates the completion category
+`ei-entry', for packages that attach to categories, and carries
+ANNOTATOR as the annotation function, so that candidates show the
+extra information computed by `ei-candidate-annotation'.  The
+affixation function shows the same annotations aligned in one
+column."
+  (let ((affixator
+         (lambda (candidates)
+           (let ((width (cl-loop for cand in candidates
+                                 maximize (string-width cand))))
+             (mapcar
+              (lambda (cand)
+                (let ((annotation (funcall annotator cand)))
+                  (list cand ""
+                        (if annotation
+                            (concat (make-string
+                                     (- width (string-width cand)) ?\s)
+                                    annotation)
+                          ""))))
+              candidates)))))
+    (lambda (string pred action)
       (if (eq action 'metadata)
-            `(metadata (annotation-function . ,annotator))
-        (complete-with-action action collection string pred))))
+          `(metadata (category . ei-entry)
+                     (annotation-function . ,annotator)
+                     (affixation-function . ,affixator))
+        (complete-with-action action collection string pred)))))
 
-(cl-defun ei-choose--read-and-handle (prompt collection handler
-                                            &key object path
-                                            (history-list nil)
-                                            (require-match nil)
-                                            (initial-input nil)
-                                            (annotation nil))
+(cl-defun ei-read (prompt collection handler
+                          &key object path
+                          (history-list nil)
+                          (require-match nil)
+                          (initial-input nil)
+                          (annotation nil))
   "Read one entry of COLLECTION and run HANDLER on the choice.
 Bind the choice context OBJECT and PATH, activate
 `ei-choose-minibuffer-map', annotate the candidates with
@@ -796,7 +999,7 @@ NEW-HISTORY)) for a completed entry."
   (let* ((table (if annotation
                     (ei-choose--annotated-table collection annotation)
                   collection))
-         (prompt (ei-choose--prompt prompt))
+         (prompt (ei-choose--prompt prompt path))
          (choice
           (let ((ei-current-object object)
                 (ei-current-path path))
@@ -817,7 +1020,7 @@ NEW-HISTORY)) for a completed entry."
              (cons :choice (cons choice history-list))))))
 
 (defun ei-choose--handle-read-result (result handler)
-  "Dispatch on RESULT of `ei-choose--read', calling HANDLER.
+  "Dispatch on RESULT of `ei-read', calling HANDLER.
 RESULT is either (cons :choice (CHOICE . NEW-HISTORY)), whose two
 parts are passed to HANDLER, or (cons :action (FUNCTION OBJECT
 PATH)), in which case FUNCTION is applied to OBJECT with the
@@ -830,14 +1033,14 @@ choice context bound and its result returned."
     (`(:choice ,choice . ,new-history)
      (funcall handler choice new-history))))
 
-(defun ei-choose--read-choice (prompt collection &rest keys)
+(defun ei-read-choice (prompt collection &rest keys)
   "Read one entry of COLLECTION through the choice interface.
-A convenience wrapper over `ei-choose--read-and-handle' for
+A convenience wrapper over `ei-read' for
 callers that only need the chosen entry: PROMPT, COLLECTION and
 KEYS are passed through and the chosen entry's name is returned.
 When an action was picked in the menu instead of choosing, the
 result of running that action is returned."
-  (apply #'ei-choose--read-and-handle
+  (apply #'ei-read
          prompt collection
          (lambda (choice _new-history) choice)
          keys))
@@ -849,13 +1052,13 @@ annotations of the interface; an entry matching no candidate
 names a new element, converted by `ei-choose--list-entry-element'.
 HISTORY-LIST is the history threaded through the reads.  Return
 the new element."
-  (ei-choose--read-and-handle
+  (ei-read
     "New element: " (mapcar #'car (ei-choose--list-entries lst))
     (lambda (choice _new-history)
       (ei-choose--list-entry-element lst choice))
     :object lst :path ei-current-path
     :history-list history-list
-    :annotation (ei-choose--annotator lst)))
+    :annotation (ei-annotator lst)))
 
 
 
@@ -915,18 +1118,41 @@ themselves, everything else by its printed form."
   "Return the element of LST named by the candidate string CHOICE.
 An existing entry's element is returned; a CHOICE matching no
 entry of a list of strings or characters is the new element
-itself, and any other unmatched CHOICE is read as a Lisp object."
+itself, and any other unmatched CHOICE is read as a Lisp object.
+A CHOICE with no Lisp reading (the empty string of a bare RET,
+or an unbalanced fragment) has no element; return nil instead of
+signaling out of the reader."
   (or (cdr (assoc choice (ei-choose--list-entries lst)))
       (cond
        ((cl-every #'stringp lst) choice)
        ((cl-every #'characterp lst) (string-to-char choice))
-       (t (car-safe (read-from-string choice))))))
+       (t (condition-case nil
+            (car-safe (read-from-string choice))
+          (error nil))))))
 
 
 (defun ei-choose--hash-entries (table)
   "Return the entries (NAME . KEY) for the keys of TABLE."
   (mapcar (lambda (k) (cons (format "%s" k) k))
           (hash-table-keys table)))
+
+(defun ei-choose--hash-entry-key (table choice)
+  "Return the key of TABLE named by the candidate string CHOICE.
+An existing entry's key is returned.  A CHOICE matching no entry
+names a new key: CHOICE itself when all keys of TABLE are
+strings, the symbol named CHOICE when they are all symbols, and
+otherwise --- also for an empty TABLE --- CHOICE read as a Lisp
+object.  Return nil for a CHOICE with no Lisp reading, such as
+the empty string of a bare RET."
+  (let ((entry (assoc choice (ei-choose--hash-entries table)))
+        (keys (hash-table-keys table)))
+    (cond (entry (cdr entry))
+          ((string-empty-p choice) nil)
+          ((and keys (cl-every #'stringp keys)) choice)
+          ((and keys (cl-every #'symbolp keys)) (intern choice))
+          (t (condition-case nil
+                 (car (read-from-string choice))
+               (error nil))))))
 
 (defun ei-choose--container-kind (value)
   "Return the container kind of VALUE, or nil for leaf values.
@@ -937,6 +1163,13 @@ The container kinds are `eieio', `obarray', `hash-table' and
         ((hash-table-p value) 'hash-table)
         ((and (listp value) value) 'list)
         (t nil)))
+
+(defun ei-choose--constant-symbol-p (value)
+  "Return non-nil when VALUE is a symbol that cannot hold a new value.
+These are the constants `t' and `nil' and all keywords.  They are
+leaf values of the choice tree: descending into their properties
+or their own value cannot edit the place that holds them."
+  (or (memq value '(t nil)) (keywordp value)))
 
 (defun ei-choose--value-compatible-p (old new)
   "Return non-nil when NEW may replace OLD in an edited place.
@@ -968,17 +1201,27 @@ replacing.  Return NEW-VALUE."
 (defun ei-choose--short (object width)
   "Return a one-line printed form of OBJECT of at most WIDTH chars.
 Newlines and tabs are replaced by spaces; longer forms are cut
-and terminated with an ellipsis."
+and terminated with an ellipsis.  Printing stops as soon as more
+than WIDTH characters were produced, so the cost does not depend
+on the size of OBJECT."
   (let ((printed (replace-regexp-in-string
                   "[\n\r\t]" " "
                   (condition-case nil
-                          (format "%s" object)
-                      (error "#<unprintable>")))))
+                      (let ((chars nil)
+                            (count 0))
+                        (catch 'ei-choose--short
+                          (princ object
+                                 (lambda (ch)
+                                   (push ch chars)
+                                   (when (> (cl-incf count) width)
+                                     (throw 'ei-choose--short nil)))))
+                        (concat (nreverse chars)))
+                    (error "#<unprintable>")))))
     (if (<= (length printed) width)
             printed
         (concat (substring printed 0 (max 0 (1- width))) "…"))))
 
-(defun ei-choose--annotation-face (annotation)
+(defun ei-annotation-face (annotation)
   "Return ANNOTATION propertized for the *Completions* buffer.
 Nil and empty annotations are returned as nil."
   (if (and annotation (not (string-empty-p annotation)))
@@ -987,6 +1230,9 @@ Nil and empty annotations are returned as nil."
                                 'completions-annotations t annotation)
         annotation)
     nil))
+
+(define-obsolete-function-alias 'ei-choose--annotation-face
+  #'ei-annotation-face "0.2.0")
 
 (provide 'ei-choose)
 
